@@ -22,7 +22,7 @@ from .gproj_bwd import FlashAttentionBackwardGProj
 from .gproj_preprocess import GProjPreprocess
 from .gproj_ops import FusedQZ, GProjTensors, OperandProbes, KeyCorrection
 
-ABI = 1
+ABI = 2
 _CACHES = {name: get_jit_cache("gproj_" + name)
            for name in ("pre", "main", "qz", "key")}
 
@@ -106,7 +106,11 @@ def _aux_shapes():
     n, qr, rawq, rawk = (cute.sym_int() for _ in range(4))
     bf = lambda heads: fake_tensor(cutlass.BFloat16, (1, n, heads, 256), divisibility=8)
     fpraw = lambda heads, extent: fake_tensor(Float32, (1, heads, extent), divisibility=4)
-    return dict(q=bf(16), k=bf(4), dq=bf(16), dk=bf(4), z=bf(16),
+    # Equal logical shapes do not imply equal runtime strides. In particular,
+    # O is normally contiguous while dO may preserve a head-major input layout.
+    # Reusing one fake descriptor for both makes TVM FFI require stride equality.
+    return dict(q=bf(16), k=bf(4), out=bf(16), dout=bf(16),
+                dq=bf(16), dk=bf(4), z=bf(16),
                 a=fpraw(16, rawq), b=fpraw(16, rawq), dka=fpraw(4, rawk),
                 mass=fake_tensor(Float32, (16, qr), divisibility=4),
                 rho=fake_tensor(Float32, (16, qr), divisibility=4),
@@ -205,7 +209,7 @@ def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=Non
     pf = _probe_shapes(f["q"].shape[1], probes is not None) if f is not None else None
     preargs = (out, dout, delta, lse, log2lse, a, None, None, None, None, None, 1.0,
                None, None, b, mass, rho)
-    predesc = None if f is None else (f["q"], f["q"], f["delta"], f["lse"], f["log2lse"], f["a"],
+    predesc = None if f is None else (f["out"], f["dout"], f["delta"], f["lse"], f["log2lse"], f["a"],
                None, None, None, None, None, Float32(1.0), None, None,
                f["b"], f["mass"], f["rho"])
     _run("pre", GProjPreprocess(cutlass.BFloat16, 256, 256, 64, hdim_multiple_of=64),
