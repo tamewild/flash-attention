@@ -47,6 +47,9 @@ Repository = "https://github.com/Dao-AILab/flash-attention"
 packages = ["flash_attn.cute"]
 package-dir = {"flash_attn.cute" = "."}
 
+[tool.setuptools.package-data]
+"flash_attn.cute" = ["_pcss_patch_manifest.json"]
+
 [tool.setuptools_scm]
 root = "../.."
 tag_regex = "^fa4-v(?P<version>.+)$"

@@ -19,6 +19,7 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
+from flash_attn.cute.numerics import resolve_numerics, validate_numerics
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -716,6 +717,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    numerical_mode: str = "native",
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -733,6 +735,23 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    numerical_mode, _ = resolve_numerics(numerical_mode)
+    if numerical_mode != "native":
+        validate_numerics(numerical_mode, q, k, v,
+            arch=_get_device_arch() if _arch is None else _arch,
+            causal=causal, softmax_scale=softmax_scale,
+            varlen=any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)),
+            num_splits=num_splits, pack_gqa=pack_gqa,
+            window_size=(window_size_left, window_size_right),
+            qv=qv, page_table=page_table, gather_kv_indices=gather_kv_indices,
+            softcap=softcap, score_mod=score_mod, mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors, aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars, learnable_sink=learnable_sink,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            scheduler_metadata=scheduler_metadata, seqlen_k_per_split=seqlen_k_per_split,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+            gather_bwd_recompute_p=gather_bwd_recompute_p,
+            tile_mn=tile_mn, mma_pv_is_rs=mma_pv_is_rs, intra_wg_overlap=intra_wg_overlap)
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -1410,6 +1429,7 @@ def _flash_attn_fwd(
     )
     
     compile_key = (
+        numerical_mode != "native",
         mla_1cta,
         mla_1cta_kb64,
         mla_1cta_s_ahead if mla_1cta else None,
@@ -1609,6 +1629,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                sbs=numerical_mode != "native",
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -2271,7 +2292,23 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    numerical_mode: str = "native",
+    key_pipeline: str = "two_stage",
+    gproj_diagnostic=None,
 ) -> Tuple[torch.Tensor, ...]:
+    numerical_mode, key_pipeline = resolve_numerics(numerical_mode, key_pipeline)
+    if numerical_mode != "native":
+        validate_numerics(numerical_mode, q, k, v, arch=_get_device_arch(),
+            causal=causal, softmax_scale=softmax_scale, deterministic=deterministic,
+            window_size=(window_size_left, window_size_right),
+            varlen=any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)),
+            softcap=softcap, score_mod=score_mod, score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod, aux_tensors=aux_tensors, aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors, dlse=dlse, learnable_sink=learnable_sink)
+    if numerical_mode == "sbs_gproj":
+        from flash_attn.cute.gproj import backward as gproj_backward
+        return gproj_backward(q, k, v, out, dout, lse, key_pipeline=key_pipeline,
+                              dq=dq, dk=dk, dv=dv, diagnostic=gproj_diagnostic)
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -3751,7 +3788,24 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        numerical_mode: Optional[str] = None,
+        key_pipeline: Optional[str] = None,
     ):
+        numerical_mode, key_pipeline = resolve_numerics(numerical_mode, key_pipeline)
+        if numerical_mode != "native":
+            validate_numerics(numerical_mode, q, k, v, arch=_get_device_arch(),
+                causal=causal, softmax_scale=softmax_scale, num_splits=num_splits,
+                pack_gqa=pack_gqa, deterministic=deterministic, window_size=window_size,
+                varlen=False, qv=qv, gather_kv_indices=gather_kv_indices,
+                softcap=softcap, learnable_sink=learnable_sink, score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd, mask_mod=mask_mod,
+                aux_tensors=aux_tensors, aux_scalars=aux_scalars,
+                block_sparse_tensors=block_sparse_tensors)
+        ctx.numerical_mode, ctx.key_pipeline = numerical_mode, key_pipeline
+        ctx.gproj_diagnostic = None
+        if numerical_mode == "sbs_gproj":
+            from flash_attn.cute.gproj import _DIAGNOSTIC
+            ctx.gproj_diagnostic = _DIAGNOSTIC.get()
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -3781,6 +3835,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            numerical_mode=numerical_mode,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3804,6 +3859,8 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, dlse):
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
+        if ctx.numerical_mode != "native" and dlse is not None:
+            raise ValueError("Opt-in FA4 modes do not support gradients of returned LSE")
         if not ctx.return_lse:
             dlse = None
         if dout is None:
@@ -3828,9 +3885,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return (dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16))[:len(ctx.needs_input_grad)]
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return (dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16))[:len(ctx.needs_input_grad)]
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3853,13 +3910,16 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                numerical_mode=ctx.numerical_mode,
+                key_pipeline=ctx.key_pipeline,
+                gproj_diagnostic=ctx.gproj_diagnostic,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return (dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16))[:len(ctx.needs_input_grad)]
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3899,7 +3959,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        numerical_mode: Optional[str] = None,
+        key_pipeline: Optional[str] = None,
     ):
+        numerical_mode, key_pipeline = resolve_numerics(numerical_mode, key_pipeline)
+        if numerical_mode != "native":
+            validate_numerics(numerical_mode, q, k, v, arch=_get_device_arch(),
+                causal=causal, softmax_scale=softmax_scale, num_splits=num_splits,
+                pack_gqa=pack_gqa, deterministic=deterministic, window_size=window_size,
+                varlen=True, qv=qv, gather_kv_indices=gather_kv_indices,
+                softcap=softcap, learnable_sink=learnable_sink, score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd, mask_mod=mask_mod,
+                aux_tensors=aux_tensors, aux_scalars=aux_scalars,
+                block_sparse_tensors=block_sparse_tensors)
+        ctx.numerical_mode, ctx.key_pipeline = numerical_mode, key_pipeline
+        ctx.gproj_diagnostic = None
+        if numerical_mode == "sbs_gproj":
+            from flash_attn.cute.gproj import _DIAGNOSTIC
+            ctx.gproj_diagnostic = _DIAGNOSTIC.get()
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -3940,6 +4017,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            numerical_mode=numerical_mode,
         )
         ctx.save_for_backward(
             q,
@@ -3982,6 +4060,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, dlse):
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
+        if ctx.numerical_mode != "native" and dlse is not None:
+            raise ValueError("Opt-in FA4 modes do not support gradients of returned LSE")
         if not ctx.return_lse:
             dlse = None
         if dout is None:
@@ -4013,9 +4093,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return (dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18))[:len(ctx.needs_input_grad)]
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return (dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18))[:len(ctx.needs_input_grad)]
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4043,13 +4123,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 mask_mod=ctx.mask_mod,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                numerical_mode=ctx.numerical_mode,
+                key_pipeline=ctx.key_pipeline,
+                gproj_diagnostic=ctx.gproj_diagnostic,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return (dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18))[:len(ctx.needs_input_grad)]
 
 
 def _validate_gather_bwd_kwargs(
@@ -4113,7 +4196,21 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    *,
+    numerical_mode: Optional[str] = None,
+    key_pipeline: Optional[str] = None,
 ):
+    numerical_mode, key_pipeline = resolve_numerics(numerical_mode, key_pipeline)
+    if numerical_mode != "native":
+        validate_numerics(numerical_mode, q, k, v, arch=_get_device_arch(),
+            causal=causal, softmax_scale=softmax_scale, num_splits=num_splits,
+            pack_gqa=pack_gqa, deterministic=deterministic, window_size=window_size,
+            varlen=False, qv=qv, gather_kv_indices=gather_kv_indices,
+            learnable_sink=learnable_sink, softcap=softcap, score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd, mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors, aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars, gather_bwd_recompute_p=gather_bwd_recompute_p,
+            gather_bwd_token_chunk=gather_bwd_token_chunk, block_sparse_tensors_bwd=block_sparse_tensors_bwd)
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4155,6 +4252,8 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        numerical_mode,
+        key_pipeline,
     )
 
 
@@ -4192,6 +4291,9 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    *,
+    numerical_mode: Optional[str] = None,
+    key_pipeline: Optional[str] = None,
 ):
     """
     Tensor arguments:
@@ -4258,6 +4360,18 @@ def flash_attn_varlen_func(
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
     """
+    numerical_mode, key_pipeline = resolve_numerics(numerical_mode, key_pipeline)
+    if numerical_mode != "native":
+        validate_numerics(numerical_mode, q, k, v, arch=_get_device_arch(),
+            causal=causal, softmax_scale=softmax_scale, num_splits=num_splits,
+            pack_gqa=pack_gqa, deterministic=deterministic, window_size=window_size,
+            varlen=True, qv=qv, gather_kv_indices=gather_kv_indices,
+            learnable_sink=learnable_sink, softcap=softcap, score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd, mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors, aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars, gather_bwd_recompute_p=gather_bwd_recompute_p,
+            gather_bwd_token_chunk=gather_bwd_token_chunk, page_table=page_table, scheduler_metadata=scheduler_metadata,
+            seqlen_k_per_split=seqlen_k_per_split, disable_scheduler_metadata=disable_scheduler_metadata)
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4295,6 +4409,8 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        numerical_mode,
+        key_pipeline,
     )
 
 

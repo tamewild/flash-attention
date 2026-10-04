@@ -25,6 +25,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+from flash_attn.cute.softmax_sbs import SoftmaxSBS
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -56,9 +57,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        sbs: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.sbs = sbs
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
@@ -1005,7 +1008,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-        softmax = Softmax.create(
+        softmax_cls = SoftmaxSBS if const_expr(self.sbs) else Softmax
+        softmax = softmax_cls.create(
             softmax_scale_log2,
             num_rows=acc_O.shape[0][0] * acc_O.shape[1],
             softmax_scale=softmax_scale,
