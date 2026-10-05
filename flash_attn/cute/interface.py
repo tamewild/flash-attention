@@ -2308,6 +2308,7 @@ def _flash_attn_bwd(
     if numerical_mode == "sbs_gproj":
         from flash_attn.cute.gproj import backward as gproj_backward
         return gproj_backward(q, k, v, out, dout, lse, key_pipeline=key_pipeline,
+                              deterministic=deterministic,
                               dq=dq, dk=dk, dv=dv, diagnostic=gproj_diagnostic)
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()

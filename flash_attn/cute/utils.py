@@ -261,8 +261,27 @@ def convert_from_dlpack_compact_dynamic(
 def convert_from_dlpack_leading_static(
     x, leading_dim, alignment=16, static_modes=None, stride_order=None
 ) -> cute.Tensor:
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensor
+    from .cute_dsl_utils import torch2cute_dtype_map
     if stride_order is None:
         stride_order = x.dim_order()
+    # Use metadata only when compiling fake tensors. Deterministic backward
+    # creates semaphore tensors too; FakeTensor DLPack can otherwise query a
+    # CUDA device even during an explicitly CPU-only compile.
+    if isinstance(x, FakeTensor):
+        shape = tuple(
+            size if i == leading_dim or static_modes is not None and i in static_modes
+            else cute.sym_int64()
+            for i, size in enumerate(x.shape)
+        )
+        # Torch dim_order lists axes from slowest to fastest; CuTe takes
+        # the inverse ranking, with rank zero denoting stride one.
+        order = tuple(x.ndim - 1 - stride_order.index(i) for i in range(x.ndim))
+        return cute.runtime.make_fake_compact_tensor(
+            Int32 if x.dtype == torch.int32 else torch2cute_dtype_map[x.dtype],
+            shape, stride_order=order, assumed_align=alignment,
+        )
     x_ = from_dlpack(x, assumed_align=alignment)
     for i in range(x.ndim):
         if i != leading_dim and (static_modes is None or i not in static_modes):

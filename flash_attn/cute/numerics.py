@@ -89,8 +89,8 @@ def validate_numerics(mode, q, k, v, *, arch, causal, softmax_scale,
         failures.append("split forward/automatic splitting")
     if pack_gqa is False:
         failures.append("disabled forward GQA head packing")
-    if deterministic:
-        failures.append("deterministic execution")
+    if not isinstance(deterministic, bool):
+        failures.append("non-boolean deterministic flag")
     if tuple(window_size) != (None, None):
         failures.append("local/window attention")
     for name, value in options.items():

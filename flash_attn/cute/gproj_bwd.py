@@ -800,7 +800,7 @@ class FlashAttentionBackwardGProj:
             if warp_idx == 1:
                 self.dQaccum_store(
                     mdQaccum,
-                    gp.b,
+                    gp,
                     sdQaccum,
                     block_info,
                     TileSchedulerCls,
@@ -1612,7 +1612,8 @@ class FlashAttentionBackwardGProj:
             cute.arch.fence_view_async_shared()
             PdS_barrier.arrive_and_wait()
 
-        finish_operands(gp, row_parts, cS_gp, m_block, gp_head, gp_length, warp_group_idx)
+        finish_operands(gp, row_parts, cS_gp, m_block, gp_head, gp_length,
+                        warp_group_idx, deterministic=self.deterministic)
 
         # R2S for dS
         copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
@@ -1844,7 +1845,7 @@ class FlashAttentionBackwardGProj:
     def dQaccum_store(
         self,
         mdQaccum: cute.Tensor,
-        mBaccum: cute.Tensor,
+        gp: GProjTensors,
         sdQaccum: cute.Tensor,
         block_info: BlockInfo,
         TileSchedulerCls: cutlass.Constexpr[Callable],
@@ -1868,7 +1869,7 @@ class FlashAttentionBackwardGProj:
                 mdQaccum_cur = cute.domain_offset(
                     (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
                 )
-            mBaccum_cur = mBaccum[None, head_idx, batch_idx]
+            mBaccum_cur = gp.b[None, head_idx, batch_idx]
             # ((M * K / num_wg_dQ, num_wg_dQ), num_m_blocks)
             gdQaccum = cute.local_tile(
                 mdQaccum_cur,
@@ -1916,11 +1917,12 @@ class FlashAttentionBackwardGProj:
                             destination = gdQaccum if const_expr(gp_phase == 0) else gBaccum
                             num_dQ_chunks = self.num_wg_dQ
                             for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
-                                if const_expr(not self.deterministic):
-                                    # If deterministic, we already waited at the end of the prev iter
-                                    cute.arch.cp_async_bulk_wait_group(
-                                        num_dQ_chunks - 1 - warp_group_idx, read=read_flag
-                                    )
+                                # Both phases reuse sdQaccum. A's transfer must
+                                # finish reading each chunk before B may write
+                                # it, even while one deterministic turn is held.
+                                cute.arch.cp_async_bulk_wait_group(
+                                    num_dQ_chunks - 1 - warp_group_idx, read=True
+                                )
                                 cute.arch.barrier_arrive(
                                     barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
                                     number_of_threads=self.num_threads_per_warp_group
@@ -1928,7 +1930,7 @@ class FlashAttentionBackwardGProj:
                                 )
     
                             # Semaphore acquire: wait for prior n_blocks to finish writing this m_block
-                            if const_expr(self.deterministic):
+                            if const_expr(self.deterministic and gp_phase == 0):
                                 if const_expr(self.spt):
                                     _, n_block_max_for_m_block = block_info.get_n_block_min_max(
                                         seqlen, m_block_safe
@@ -1956,6 +1958,29 @@ class FlashAttentionBackwardGProj:
                                         self.tma_copy_bytes["dQ"],
                                     )
                                 cute.arch.cp_async_bulk_commit_group()
+                            if const_expr(self.deterministic and gp_phase == 0):
+                                # Full A barriers include all compute threads
+                                # that published this tile's combined packet.
+                                # Read/update all 64 rows before *any* B empty
+                                # barrier permits scratch reuse. Retain the
+                                # original global FP32 atomic-add arithmetic.
+                                for packet_part in cutlass.range_constexpr(2):
+                                    local_row = warp_local_tidx + packet_part * 32
+                                    row = m_block_safe * self.tile_m + local_row
+                                    if row < seqlen.seqlen_q:
+                                        utils.atomic_add_fp32(
+                                            gp.stats[local_row],
+                                            gp.mass.iterator + gp.mass.layout((head_idx, row)),
+                                        )
+                                        utils.atomic_add_fp32(
+                                            gp.stats[64 + local_row],
+                                            gp.rho.iterator + gp.rho.layout((head_idx, row)),
+                                        )
+                                # Carry every lane's generic-memory atomics to
+                                # the lane publishing the eventual GPU release.
+                                # Also complete every packet read before B is
+                                # permitted to advance either compute WG.
+                                cute.arch.sync_warp()
                         # Semaphore release: signal that this n_block is done with this m_block
                         if const_expr(self.deterministic):
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -2002,4 +2027,3 @@ class FlashAttentionBackwardGProj:
 
         if const_expr(not self.deterministic):
             cute.arch.cp_async_bulk_wait_group(0, read=True)
-

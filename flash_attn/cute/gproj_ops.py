@@ -71,13 +71,23 @@ def collect_operands(gp, p, g, r, t, coords, mb, nb, head, length, wg):
 
 
 @cute.jit
-def finish_operands(gp, parts, coords, mb, head, length, wg):
+def finish_operands(gp, parts, coords, mb, head, length, wg,
+                    deterministic: cutlass.Constexpr = False):
     # Called after the existing 256-thread PdS barrier, before its next barrier.
     if cute.arch.lane_idx() % 4 == 0 and wg == 0:
         for i in cutlass.range_constexpr(cute.size(parts, mode=[0])):
             local_row = coords[i, 0][0]
             row = mb * 64 + local_row
-            if row < length:
+            if const_expr(deterministic):
+                # WG0 publishes one combined packet. dQFullWG0 makes these
+                # stores visible to the store warp. That warp consumes every
+                # row before releasing either B-stage empty barrier, so neither
+                # compute WG can reach the next iteration's scratch writes yet.
+                gp.stats[local_row] = (parts[i, 0] + gp.stats[local_row]
+                                       if row < length else Float32(0))
+                gp.stats[64 + local_row] = (parts[i, 1] + gp.stats[64 + local_row]
+                                            if row < length else Float32(0))
+            elif row < length:
                 utils.atomic_add_fp32(parts[i, 0] + gp.stats[local_row],
                                      gp.mass.iterator + gp.mass.layout((head, row)))
                 utils.atomic_add_fp32(parts[i, 1] + gp.stats[64 + local_row],

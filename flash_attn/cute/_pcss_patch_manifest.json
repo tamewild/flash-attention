@@ -1,9 +1,9 @@
 {
   "format_version": 1,
   "distribution": "flash-attn-4",
-  "version": "0.0.0+pcss.gproj20261004",
+  "version": "0.0.0+pcss.deterministic20261005",
   "baseline_commit": "843bf0b86bda1c92edc440ec58f9b5194609abac",
-  "date": "2026-10-04",
+  "date": "2026-10-05",
   "default_mode": "native",
   "sources": {
     "flash_attn/cute/__init__.py": "996bacdd2a396da957c822cc1308a9904b4feb231d7e7177df476c92304278d6",
@@ -42,15 +42,15 @@
     "flash_attn/cute/flash_fwd_sm100.py": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3",
     "flash_attn/cute/flash_fwd_sm120.py": "abd017add69914e46f0fcfc017ad51c3d07d79fd87d15f969036ddd82bcc7da2",
     "flash_attn/cute/flash_fwd_sm90.py": "4cbe866175d9fab3a1f403be3ed25d0d4ca570d6569f24143a04899d48b8e33c",
-    "flash_attn/cute/gproj.py": "71a46f71327ac7c142fa4a6f146bf4f584307c2ef21c4f8f4b83686226f922bb",
-    "flash_attn/cute/gproj_bwd.py": "ec84e7b8d76dbd8acc385469c53b6411684898ade1f5e03c7a4550f9c54cd54f",
-    "flash_attn/cute/gproj_ops.py": "81ecb203029183a9254048113fa9b5084ab9232ccf1b31ac9a63b159115363d3",
+    "flash_attn/cute/gproj.py": "ff8f692c2a288231ceda68176260983ab8a9df03a723db0285ce30f6de2c5c7f",
+    "flash_attn/cute/gproj_bwd.py": "20efeedc57360aed0b502d85457e51a548c7ff2f6838417c364464bce510800a",
+    "flash_attn/cute/gproj_ops.py": "2b774e479591c65bc0589b2ce66066399c7e0431ce0307d68485359ac927eb56",
     "flash_attn/cute/gproj_preprocess.py": "1efcb3cea4dfff110d3534723459e4a17a37bbe8a0a41b774107a0ba54bbfc40",
-    "flash_attn/cute/interface.py": "823e1d85c04d98d86b83d8ff4775319cc12c3f3e225272bc1361f7f644edaf83",
+    "flash_attn/cute/interface.py": "4a35aeb3f82f925bbbe3cc5a25215760fb4da75ee0f127b8f0ecc1f9ee15d5eb",
     "flash_attn/cute/mask.py": "a59a0ac2d10c6c0e799a08c216f706a3ccca09eba65778ddc6ed0151a0489684",
     "flash_attn/cute/mma_sm100_desc.py": "ac6ec28b2f1a4b797c391a7807b88f83b430452d418262c3dfa7b0f3516e39f9",
     "flash_attn/cute/named_barrier.py": "1f80f96b690a2888ee1301d377665db6e9dd74b402f80eaa867d38f7294d813b",
-    "flash_attn/cute/numerics.py": "85de788bcb044617a5d8b54fae8ce6d6ab54d96c994a643f420fd3f88c835730",
+    "flash_attn/cute/numerics.py": "4ec5acbd96fee0177ed803fc6bc1a3fbf19514de8614e3389ea494f0e9583039",
     "flash_attn/cute/pack_gqa.py": "196fa8004d56a3184b6a7f314f12ffb202b1a431583cf31301dd61e719de94f9",
     "flash_attn/cute/paged_kv.py": "da5b59b0cfca490c1e0b297ecc230a5d6ad99c41bd26705b27306d24455a40a5",
     "flash_attn/cute/pipeline.py": "849bce91c72be0a5c7458979e10c8290f45e05253a83600e30fb9540c61ed56a",
@@ -66,6 +66,6 @@
     "flash_attn/cute/testing.py": "98ef40f06ddea3b508a216debdadb731af37df1e3dc04a0e352286c6e29826e9",
     "flash_attn/cute/tile_scheduler.py": "64c5738daa4e22e3b6f838bd1f156156a80b4cb3818b6167074ac75f8ce62ab1",
     "flash_attn/cute/topk_gather_kv.py": "c32e091958c122f5d205b19853ddcb26603be174c2b9c057ce567d831380d5df",
-    "flash_attn/cute/utils.py": "95648712d5235deb477773ee388fd4ebcbeabdfa0c33709e413010edae994a5d"
+    "flash_attn/cute/utils.py": "c0d704d07d9f50c1e45f378d41597258810e1211db2f3ba54f2b8358c5c689d3"
   }
 }

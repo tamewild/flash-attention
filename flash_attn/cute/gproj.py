@@ -21,8 +21,9 @@ from .testing import is_fake_mode
 from .gproj_bwd import FlashAttentionBackwardGProj
 from .gproj_preprocess import GProjPreprocess
 from .gproj_ops import FusedQZ, GProjTensors, OperandProbes, KeyCorrection
+from . import utils
 
-ABI = 2
+ABI = 3
 _CACHES = {name: get_jit_cache("gproj_" + name)
            for name in ("pre", "main", "qz", "key")}
 
@@ -154,10 +155,13 @@ def _key_only(state, key_pipeline, *, output=None, columns=None, sample=None):
     return output
 
 
-def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=None):
+def _backward(q, k, v, out, dout, lse, *, key_pipeline, deterministic=False,
+              dq=None, dk=None, dv=None):
     from .interface import _bwd_postprocess_convert
     if not is_fake_mode() and not q.is_cuda:
         raise ValueError("GProj inputs must be on CUDA")
+    if not isinstance(deterministic, bool):
+        raise ValueError("GProj deterministic must be a bool")
     q, k, v, out, dout, lse = [maybe_contiguous(x) for x in (q, k, v, out, dout, lse)]
     n, device = q.shape[1], q.device
     if out.shape != q.shape or dout.shape != q.shape or lse.shape != (1, 16, n):
@@ -183,11 +187,19 @@ def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=Non
     # Keep the native GQA dK/dV accumulation initializers exactly as before.
     dka = torch.zeros((1, 4, kr * 256), dtype=torch.float32, device=device)
     dva = torch.zeros_like(dka)
+    semaphores = (None, None, None)
+    if deterministic:
+        semaphores = (
+            torch.zeros((1, 16, qr // 64, 1), dtype=torch.int32, device=device),
+            torch.zeros((1, 4, kr // 48, 2), dtype=torch.int32, device=device),
+            torch.zeros((1, 4, kr // 48, 2), dtype=torch.int32, device=device),
+        )
     z = torch.empty_like(q)
     debug = _DIAGNOSTIC.get()
     spec = specialization(q, k, v, dout)
     state = dict(q=q, k=k, z=z, log2lse=log2lse, dka=dka, a=a, b=b,
-                 mass=mass, rho=rho, delta=delta, specialization=spec)
+                 mass=mass, rho=rho, delta=delta, dva=dva, specialization=spec,
+                 deterministic=deterministic, semaphores=semaphores)
     probes = ids_r = ids_k = sampleq = samplek = cols2 = lam = None
     if debug is not None and debug.rows:
         if any(not 0 <= x < n for x in (*debug.rows, *debug.keys)):
@@ -202,9 +214,10 @@ def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=Non
         probes = OperandProbes(ids_r, ids_k, p, g, r, t, cols1)
         state.update(probes=probes, columns2=cols2, sampleq=sampleq,
                      samplek=samplek, lam=lam, ids_k=ids_k)
-    prekey, mainkey = (ABI,), (*spec, probes is not None)
+    prekey, qzkey = (ABI,), (*spec, probes is not None)
+    mainkey = (*qzkey, deterministic)
     needs_shapes = (prekey not in _CACHES["pre"] or mainkey not in _CACHES["main"]
-                    or mainkey not in _CACHES["qz"])
+                    or qzkey not in _CACHES["qz"])
     f = _aux_shapes() if needs_shapes else None
     pf = _probe_shapes(f["q"].shape[1], probes is not None) if f is not None else None
     preargs = (out, dout, delta, lse, log2lse, a, None, None, None, None, None, 1.0,
@@ -215,6 +228,7 @@ def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=Non
     _run("pre", GProjPreprocess(cutlass.BFloat16, 256, 256, 64, hdim_multiple_of=64),
          preargs, prekey, descriptors=predesc, state=state)
     main = FlashAttentionBackwardGProj(cutlass.BFloat16, 256, 256, 4, True,
+        deterministic=deterministic,
         tile_m=64, tile_n=48, Q_stage=2, dO_stage=1, PdS_stage=1,
         SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
         AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1, num_threads=384)
@@ -233,11 +247,22 @@ def _backward(q, k, v, out, dout, lse, *, key_pipeline, dq=None, dk=None, dv=Non
     if mainkey not in _CACHES["main"]:
         maindesc = (*(_convert(x) for x in mainargs[:-1]),
                     GProjTensors(f["b"], f["mass"], f["rho"], probe_desc))
+    # Match upstream's static final semaphore dimension and four-byte
+    # alignment. Generic aligned DLPack descriptors can specialize singleton
+    # strides incorrectly when a cold N=1 kernel is reused at real lengths.
+    semdesc = tuple(
+        utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3,
+            alignment=4, stride_order=t.dim_order()) if t is not None else None
+        for t in semaphores
+    ) if mainkey not in _CACHES["main"] else ()
+    mainargs = (*mainargs, None, None, None, None, None, None, *semaphores)
+    if maindesc is not None:
+        maindesc = (*maindesc, None, None, None, None, None, None, *semdesc)
     _run("main", main, mainargs, mainkey, descriptors=maindesc, state=state)
     qargs = (a, b, mass, rho, q, dq, z, ids_r, sampleq, lam)
     qdesc = None if f is None else (f["a"], f["b"], f["mass"], f["rho"], f["q"], f["dq"], f["z"],
              pf["rows"], pf["sampleq"], pf["lam"])
-    _run("qz", FusedQZ(), qargs, (*spec, probes is not None), descriptors=qdesc, state=state)
+    _run("qz", FusedQZ(), qargs, qzkey, descriptors=qdesc, state=state)
     _key_only(state, key_pipeline, output=dk, columns=cols2, sample=samplek)
     if debug is not None and debug.time_passes and not is_fake_mode():
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
